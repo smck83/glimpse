@@ -1,0 +1,14 @@
+services:
+  glimpse:
+    build: .
+    container_name: glimpse
+    restart: unless-stopped
+    ports:
+      - "8765:8000"
+    volumes:
+      - glimpse_data:/data
+    env_file:
+      - .env
+
+volumes:
+  glimpse_data:
