@@ -239,6 +239,25 @@ python3 -c "
 import sqlite3
 conn = sqlite3.connect('/data/glimpse.db')
 cols = [r[0] for r in conn.execute(\"SELECT name FROM pragma_table_info('published')\").fetchall()]
+needed = ['sha','comment','expires_at','deleted_at','portal_key','backend',
+          'burn_on_read','burnt_at','destroy_token','decrypt_verifier','content_type']
+for col in needed:
+    if col not in cols:
+        default = ' DEFAULT 0' if col == 'burn_on_read' else ''
+        conn.execute(f'ALTER TABLE published ADD COLUMN {col} TEXT{default}')
+        print(f'Added: {col}')
+    else:
+        print(f'Already exists: {col}')
+conn.commit()
+conn.close()
+"
+```
+
+```bash
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('/data/glimpse.db')
+cols = [r[0] for r in conn.execute(\"SELECT name FROM pragma_table_info('published')\").fetchall()]
 needed = ['sha', 'comment', 'expires_at', 'deleted_at', 'portal_key', 'backend']
 for col in needed:
     if col not in cols:
