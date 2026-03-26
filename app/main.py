@@ -5,12 +5,14 @@ import secrets
 import sqlite3
 import base64
 import json
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
@@ -20,6 +22,11 @@ from slowapi.errors import RateLimitExceeded
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from .words import ADJECTIVES, NOUNS
+from .storage import get_backend, LocalBackend
+from .eml_parser import parse_eml, render_eml_report
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Rate limiter ---
 limiter = Limiter(key_func=get_remote_address)
@@ -28,20 +35,18 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- Config ---
-GITHUB_TOKEN     = os.environ["GITHUB_TOKEN"]
-GITHUB_REPO      = os.environ["GITHUB_REPO"]
-GITHUB_BRANCH    = os.environ.get("GITHUB_BRANCH", "main")
-APP_API_KEY      = os.environ["APP_API_KEY"]
-DB_PATH          = os.environ.get("DB_PATH", "/data/glimpse.db")
-PAGES_BASE_URL   = os.environ.get("PAGES_BASE_URL", f"https://{GITHUB_REPO.split('/')[0]}.github.io")
-VAULT_SUBDIR     = os.environ.get("VAULT_SUBDIR", "vault")
+APP_API_KEY       = os.environ["APP_API_KEY"]
+DB_PATH           = os.environ.get("DB_PATH", "/data/glimpse.db")
 GLIMPSE_PUBLIC_URL = os.environ.get("GLIMPSE_PUBLIC_URL", "https://glimpseadmin.mck.la")
-MAX_LOG_ROWS     = 500   # max access_log rows per slug
-DEFAULT_EXPIRY   = 7
-MAX_EXPIRY       = 90
+DEFAULT_EXPIRY    = 7
+MAX_EXPIRY        = 90
+MAX_FILE_SIZE_MB  = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_BYTES    = MAX_FILE_SIZE_MB * 1024 * 1024
+
+# Initialise storage backend once at module load
+storage = get_backend()
 
 # --- Recipient page template ---
-# GLIMPSE_PUBLIC_URL and SLUG are injected at publish time by build_recipient_page()
 RECIPIENT_TEMPLATE = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -87,51 +92,31 @@ button:disabled{{opacity:0.5;cursor:not-allowed;filter:none}}
   <div class="footer">encrypted with AES-256-GCM</div>
 </div>
 <script>
-const PAYLOAD      = {payload_json};
-const TRACK_BASE   = '{public_url}/api/track/{slug}';
-
-function beacon(event) {{
-  try {{ fetch(TRACK_BASE + '/' + event, {{method:'POST',keepalive:true}}); }} catch(e) {{}}
-}}
-
-// Fire view beacon immediately on load
+const PAYLOAD    = {payload_json};
+const TRACK_BASE = '{public_url}/api/track/{slug}';
+function beacon(event) {{ try {{ fetch(TRACK_BASE+'/'+event,{{method:'POST',keepalive:true}}); }} catch(e) {{}} }}
 beacon('view');
-
 async function decrypt() {{
-  const btn = document.getElementById('btn');
-  const msg = document.getElementById('msg');
-  const pw  = document.getElementById('pw').value;
-  if (!pw) {{ msg.textContent = 'Enter the password.'; return; }}
-  btn.disabled = true; btn.textContent = 'Decrypting...'; msg.textContent = '';
+  const btn=document.getElementById('btn'),msg=document.getElementById('msg'),pw=document.getElementById('pw').value;
+  if(!pw){{msg.textContent='Enter the password.';return;}}
+  btn.disabled=true;btn.textContent='Decrypting...';msg.textContent='';
   try {{
-    const salt       = b64ToBytes(PAYLOAD.salt);
-    const iv         = b64ToBytes(PAYLOAD.iv);
-    const ciphertext = b64ToBytes(PAYLOAD.ct);
-    const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
-    const key = await crypto.subtle.deriveKey(
-      {{name:'PBKDF2', salt, iterations:600000, hash:'SHA-256'}},
-      keyMaterial, {{name:'AES-GCM', length:256}}, false, ['decrypt']
-    );
-    const plain = await crypto.subtle.decrypt({{name:'AES-GCM', iv}}, key, ciphertext);
+    const salt=b64ToBytes(PAYLOAD.salt),iv=b64ToBytes(PAYLOAD.iv),ct=b64ToBytes(PAYLOAD.ct);
+    const km=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveKey']);
+    const key=await crypto.subtle.deriveKey({{name:'PBKDF2',salt,iterations:600000,hash:'SHA-256'}},km,{{name:'AES-GCM',length:256}},false,['decrypt']);
+    const plain=await crypto.subtle.decrypt({{name:'AES-GCM',iv}},key,ct);
     beacon('decrypt');
-    const html = new TextDecoder().decode(plain);
-    document.open(); document.write(html); document.close();
+    const html=new TextDecoder().decode(plain);
+    document.open();document.write(html);document.close();
   }} catch(e) {{
     beacon('decrypt_fail');
-    msg.textContent = 'Incorrect password or corrupted file.';
-    btn.disabled = false; btn.textContent = 'Unlock';
-    document.getElementById('pw').value = '';
-    document.getElementById('pw').focus();
+    msg.textContent='Incorrect password or corrupted file.';
+    btn.disabled=false;btn.textContent='Unlock';
+    document.getElementById('pw').value='';document.getElementById('pw').focus();
   }}
 }}
-
-document.getElementById('pw').addEventListener('keydown', e => {{ if (e.key==='Enter') decrypt(); }});
-
-function b64ToBytes(b64) {{
-  const bin = atob(b64); const buf = new Uint8Array(bin.length);
-  for (let i=0; i<bin.length; i++) buf[i] = bin.charCodeAt(i);
-  return buf;
-}}
+document.getElementById('pw').addEventListener('keydown',e=>{{if(e.key==='Enter')decrypt();}});
+function b64ToBytes(b64){{const bin=atob(b64);const buf=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)buf[i]=bin.charCodeAt(i);return buf;}}
 </script>
 </body>
 </html>"""
@@ -147,17 +132,17 @@ def init_db():
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS published (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            slug        TEXT UNIQUE NOT NULL,
-            created_at  TEXT NOT NULL,
-            github_path TEXT NOT NULL,
-            sha         TEXT NOT NULL,
-            comment     TEXT,
-            expires_at  TEXT,
-            deleted_at  TEXT,
-            portal_key  TEXT
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug         TEXT UNIQUE NOT NULL,
+            created_at   TEXT NOT NULL,
+            github_path  TEXT,
+            sha          TEXT,
+            comment      TEXT,
+            expires_at   TEXT,
+            deleted_at   TEXT,
+            portal_key   TEXT,
+            backend      TEXT
         );
-
         CREATE TABLE IF NOT EXISTS access_log (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             slug       TEXT NOT NULL,
@@ -166,7 +151,6 @@ def init_db():
             ip         TEXT,
             user_agent TEXT
         );
-
         CREATE TABLE IF NOT EXISTS portal_log (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp  TEXT NOT NULL,
@@ -187,76 +171,28 @@ def verify_key(api_key: str = Depends(api_key_header)):
     return api_key
 
 def get_client_ip(request: Request) -> str:
-    cf_ip = request.headers.get("CF-Connecting-IP")
-    if cf_ip:
-        return cf_ip
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    cf = request.headers.get("CF-Connecting-IP")
+    if cf: return cf
+    fwd = request.headers.get("X-Forwarded-For")
+    if fwd: return fwd.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
-# --- GitHub API ---
-def push_to_github(slug: str, html: str) -> tuple[str, str]:
-    """Returns (path_in_repo, sha)"""
-    path_in_repo = f"{VAULT_SUBDIR}/{slug}.html"
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path_in_repo}"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    content_b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
-    resp = httpx.put(url, headers=headers, json={
-        "message": f"glimpse: add {slug}",
-        "content": content_b64,
-        "branch": GITHUB_BRANCH,
-    }, timeout=30)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"GitHub API error {resp.status_code}: {resp.text}")
-    sha = resp.json()["content"]["sha"]
-    return path_in_repo, sha
+# --- Slug ---
+def generate_slug(conn) -> str:
+    adj_pool  = list(dict.fromkeys(ADJECTIVES))
+    noun_pool = list(dict.fromkeys(NOUNS))
+    for _ in range(100):
+        adj1 = random.choice(adj_pool)
+        adj2 = random.choice(adj_pool)
+        while adj2 == adj1: adj2 = random.choice(adj_pool)
+        noun   = random.choice(noun_pool)
+        suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=3))
+        slug   = f"{adj1}-{adj2}-{noun}-{suffix}"
+        if not conn.execute("SELECT 1 FROM published WHERE slug=?", (slug,)).fetchone():
+            return slug
+    raise RuntimeError("Could not generate unique slug after 100 attempts")
 
-def delete_from_github(github_path: str, sha: str, slug: str) -> None:
-    import json as _json
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{github_path}"
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": "application/json",
-    }
-    body = _json.dumps({
-        "message": f"glimpse: delete {slug}",
-        "sha": sha,
-        "branch": GITHUB_BRANCH,
-    }).encode("utf-8")
-    resp = httpx.request("DELETE", url, headers=headers, content=body, timeout=30)
-    if resp.status_code not in (200, 204):
-        raise RuntimeError(f"GitHub delete error {resp.status_code}: {resp.text}")
-
-# --- Auto-expiry sweep ---
-def expiry_sweep():
-    now = datetime.now(timezone.utc).isoformat()
-    conn = get_db()
-    try:
-        rows = conn.execute(
-            "SELECT slug, github_path, sha FROM published WHERE expires_at <= ? AND deleted_at IS NULL",
-            (now,)
-        ).fetchall()
-        for row in rows:
-            try:
-                delete_from_github(row["github_path"], row["sha"], row["slug"])
-            except Exception:
-                pass  # log but don't block
-            conn.execute(
-                "UPDATE published SET deleted_at=? WHERE slug=?",
-                (now, row["slug"])
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-# --- Build recipient page ---
+# --- Recipient page builder ---
 def build_recipient_page(ciphertext_b64: str, salt_b64: str, iv_b64: str, slug: str) -> str:
     payload = json.dumps({"ct": ciphertext_b64, "salt": salt_b64, "iv": iv_b64})
     return RECIPIENT_TEMPLATE.format(
@@ -265,87 +201,166 @@ def build_recipient_page(ciphertext_b64: str, salt_b64: str, iv_b64: str, slug: 
         slug=slug,
     )
 
-# --- Request/response models ---
+# --- Expiry sweep ---
+def expiry_sweep():
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT slug, github_path, sha, backend FROM published WHERE expires_at <= ? AND deleted_at IS NULL",
+            (now,)
+        ).fetchall()
+        for row in rows:
+            try:
+                storage.delete(row["slug"], dict(row))
+            except Exception as e:
+                logger.warning(f"Expiry delete failed for {row['slug']}: {e}")
+            conn.execute("UPDATE published SET deleted_at=? WHERE slug=?", (now, row["slug"]))
+        if rows:
+            conn.commit()
+            logger.info(f"Expiry sweep: deleted {len(rows)} slugs")
+    finally:
+        conn.close()
+
+# --- Request model ---
 class PublishRequest(BaseModel):
-    slug:        str
-    ciphertext:  str
-    salt:        str
-    iv:          str
-    comment:     Optional[str] = Field(None, max_length=250)
+    slug:         str
+    ciphertext:   str
+    salt:         str
+    iv:           str
+    comment:      Optional[str] = Field(None, max_length=250)
     expires_days: int = Field(DEFAULT_EXPIRY, ge=1, le=MAX_EXPIRY)
 
-# --- Routes ---
+# --- Startup ---
 @app.on_event("startup")
 def startup():
     init_db()
     scheduler = BackgroundScheduler()
     scheduler.add_job(expiry_sweep, "interval", hours=1)
     scheduler.start()
+    logger.info(f"Glimpse started. Storage: {storage.__class__.__name__}. Max file size: {MAX_FILE_SIZE_MB}MB")
 
+# --- Static routes ---
 @app.get("/", response_class=HTMLResponse)
 def index():
     with open("/app/app/static/index.html", "r") as f:
         return f.read()
 
+# Local vault file serving
+@app.get("/vault/{slug}.html")
+@limiter.limit("30/minute")
+async def serve_vault(slug: str, request: Request):
+    """Serve locally stored encrypted pages. Rate limited, silent 404."""
+    if not isinstance(storage, LocalBackend):
+        return Response(status_code=404)
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT deleted_at FROM published WHERE slug=?", (slug,)
+        ).fetchone()
+        if not row or row["deleted_at"]:
+            return Response(status_code=404)
+        path = storage.file_path(slug)
+        if not path.exists():
+            return Response(status_code=404)
+        return FileResponse(str(path), media_type="text/html")
+    finally:
+        conn.close()
+
+# --- Public config ---
 @app.get("/api/config")
 def config():
-    """Public config for the frontend - no auth needed."""
-    return JSONResponse({"public_url": GLIMPSE_PUBLIC_URL})
+    backend_name = storage.__class__.__name__.replace("Backend", "").lower()
+    return JSONResponse({
+        "public_url":   GLIMPSE_PUBLIC_URL,
+        "backend":      backend_name,
+        "max_file_mb":  MAX_FILE_SIZE_MB,
+    })
 
+# --- Words ---
 @app.get("/api/words")
 def words(_key: str = Depends(verify_key)):
-    from .words import ADJECTIVES, NOUNS
     return JSONResponse({
         "adjectives": list(dict.fromkeys(ADJECTIVES)),
         "nouns":      list(dict.fromkeys(NOUNS)),
     })
 
+# --- Auth probe ---
+@app.post("/api/auth")
+@limiter.limit("5/minute")
+async def auth_check(request: Request, _key: str = Depends(verify_key)):
+    return JSONResponse({"ok": True})
+
+# --- Login audit ---
+@app.post("/api/login_audit")
+async def login_audit(request: Request, _key: str = Depends(verify_key)):
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO portal_log (timestamp, ip, user_agent, portal_key) VALUES (?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(),
+             get_client_ip(request),
+             request.headers.get("user-agent", ""),
+             _key[-6:])
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return Response(status_code=204)
+
+# --- EML parse endpoint ---
+@app.post("/api/parse_eml")
+async def parse_eml_endpoint(
+    request: Request,
+    file: UploadFile = File(...),
+    do_dns: bool = Form(False),
+    _key: str = Depends(verify_key),
+):
+    raw = await file.read()
+    if len(raw) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail=f"File exceeds {MAX_FILE_SIZE_MB}MB limit")
+    try:
+        data    = parse_eml(raw, do_dns=do_dns)
+        html    = render_eml_report(data)
+        return JSONResponse({"html": html})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"EML parse error: {str(e)}")
+
+# --- Publish ---
 @app.post("/api/publish")
 def publish(body: PublishRequest, request: Request, _key: str = Depends(verify_key)):
     # Validate base64
     try:
-        base64.b64decode(body.ciphertext)
+        ct_bytes = base64.b64decode(body.ciphertext)
         base64.b64decode(body.salt)
         base64.b64decode(body.iv)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 in payload")
 
+    # File size check (ciphertext is slightly larger than plaintext)
+    if len(ct_bytes) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail=f"File exceeds {MAX_FILE_SIZE_MB}MB limit")
+
     conn = get_db()
     try:
-        # Check slug uniqueness
-        existing = conn.execute(
-            "SELECT 1 FROM published WHERE slug=?", (body.slug,)
-        ).fetchone()
-        if existing:
+        # Slug uniqueness
+        if conn.execute("SELECT 1 FROM published WHERE slug=?", (body.slug,)).fetchone():
             raise HTTPException(status_code=409, detail="Slug collision, please retry")
 
         page = build_recipient_page(body.ciphertext, body.salt, body.iv, body.slug)
-        github_path, sha = push_to_github(body.slug, page)
+        result = storage.write(body.slug, page)
 
         now = datetime.now(timezone.utc)
-        expires_at = None
-        if body.expires_days:
-            from datetime import timedelta
-            expires_at = (now + timedelta(days=body.expires_days)).isoformat()
-
-        # Log portal key usage
-        conn.execute(
-            "INSERT INTO portal_log (timestamp, ip, user_agent, portal_key) VALUES (?,?,?,?)",
-            (now.isoformat(), get_client_ip(request),
-             request.headers.get("user-agent", ""), _key[-6:])
-        )
+        expires_at = (now + timedelta(days=body.expires_days)).isoformat()
 
         conn.execute(
-            """INSERT INTO published
-               (slug, created_at, github_path, sha, comment, expires_at, portal_key)
-               VALUES (?,?,?,?,?,?,?)""",
-            (body.slug, now.isoformat(), github_path, sha,
-             body.comment, expires_at, _key[-6:])
+            "INSERT INTO published (slug, created_at, github_path, sha, comment, expires_at, portal_key, backend) VALUES (?,?,?,?,?,?,?,?)",
+            (body.slug, now.isoformat(), result.get("github_path"),
+             result.get("sha"), body.comment, expires_at,
+             _key[-6:], storage.__class__.__name__)
         )
         conn.commit()
-
-        public_url = f"{PAGES_BASE_URL}/{VAULT_SUBDIR}/{body.slug}.html"
-        return JSONResponse({"url": public_url, "slug": body.slug})
+        return JSONResponse({"url": result["url"], "slug": body.slug})
     except HTTPException:
         raise
     except Exception as e:
@@ -353,6 +368,7 @@ def publish(body: PublishRequest, request: Request, _key: str = Depends(verify_k
     finally:
         conn.close()
 
+# --- Delete ---
 @app.delete("/api/delete/{slug}")
 def delete_slug(slug: str, _key: str = Depends(verify_key)):
     conn = get_db()
@@ -364,9 +380,9 @@ def delete_slug(slug: str, _key: str = Depends(verify_key)):
             raise HTTPException(status_code=404, detail="Slug not found")
         if row["deleted_at"]:
             raise HTTPException(status_code=410, detail="Already deleted")
-        delete_from_github(row["github_path"], row["sha"], slug)
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("UPDATE published SET deleted_at=? WHERE slug=?", (now, slug))
+        storage.delete(slug, dict(row))
+        conn.execute("UPDATE published SET deleted_at=? WHERE slug=?",
+                     (datetime.now(timezone.utc).isoformat(), slug))
         conn.commit()
         return JSONResponse({"deleted": True})
     except HTTPException:
@@ -376,18 +392,13 @@ def delete_slug(slug: str, _key: str = Depends(verify_key)):
     finally:
         conn.close()
 
-@app.post("/api/auth")
-@limiter.limit("5/minute")
-async def auth_check(request: Request, _key: str = Depends(verify_key)):
-    """Dedicated auth probe - rate limited to 5 attempts per minute per IP."""
-    return JSONResponse({"ok": True})
-
+# --- List ---
 @app.get("/api/list")
 def list_published(_key: str = Depends(verify_key)):
     conn = get_db()
     rows = conn.execute("""
         SELECT p.slug, p.created_at, p.comment, p.expires_at, p.deleted_at,
-               p.portal_key, p.github_path,
+               p.portal_key, p.github_path, p.backend,
                COUNT(CASE WHEN a.event='view'         THEN 1 END) as views,
                COUNT(CASE WHEN a.event='decrypt'      THEN 1 END) as decrypts,
                COUNT(CASE WHEN a.event='decrypt_fail' THEN 1 END) as fails,
@@ -400,6 +411,7 @@ def list_published(_key: str = Depends(verify_key)):
     conn.close()
     return [dict(r) for r in rows]
 
+# --- Access log ---
 @app.get("/api/access_log/{slug}")
 def access_log(slug: str, _key: str = Depends(verify_key)):
     conn = get_db()
@@ -410,55 +422,41 @@ def access_log(slug: str, _key: str = Depends(verify_key)):
     conn.close()
     return [dict(r) for r in rows]
 
-# --- Tracking beacon (public, rate limited) ---
+# --- Portal log ---
+@app.get("/api/portal_log")
+def portal_log(_key: str = Depends(verify_key)):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT timestamp, ip, user_agent, portal_key FROM portal_log ORDER BY timestamp DESC LIMIT 500"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+# --- Tracking beacon ---
+MAX_LOG_ROWS = 500
+
 @app.post("/api/track/{slug}/{event}")
 @limiter.limit("10/minute")
 async def track(slug: str, event: str, request: Request):
     if event not in ("view", "decrypt", "decrypt_fail"):
         return Response(status_code=204)
-
     conn = get_db()
     try:
-        # Validate slug exists and is not deleted
         row = conn.execute(
             "SELECT 1 FROM published WHERE slug=? AND deleted_at IS NULL", (slug,)
         ).fetchone()
         if not row:
-            return Response(status_code=204)  # silent - no info leakage
-
-        # Cap log rows per slug
+            return Response(status_code=204)
         count = conn.execute(
             "SELECT COUNT(*) FROM access_log WHERE slug=?", (slug,)
         ).fetchone()[0]
         if count >= MAX_LOG_ROWS:
             return Response(status_code=204)
-
-        cf_ip = request.headers.get("CF-Connecting-IP")
-        forwarded = request.headers.get("X-Forwarded-For")
-        ip = cf_ip or (forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown"))
-
+        ip = get_client_ip(request)
         conn.execute(
             "INSERT INTO access_log (slug, event, timestamp, ip, user_agent) VALUES (?,?,?,?,?)",
             (slug, event, datetime.now(timezone.utc).isoformat(),
              ip, request.headers.get("user-agent", ""))
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    return Response(status_code=204)
-
-@app.post("/api/login_audit")
-async def login_audit(request: Request, _key: str = Depends(verify_key)):
-    """Called by frontend on successful login to log portal access."""
-    conn = get_db()
-    try:
-        conn.execute(
-            "INSERT INTO portal_log (timestamp, ip, user_agent, portal_key) VALUES (?,?,?,?)",
-            (datetime.now(timezone.utc).isoformat(),
-             get_client_ip(request),
-             request.headers.get("user-agent", ""),
-             _key[-6:])
         )
         conn.commit()
     finally:
