@@ -17,7 +17,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -28,20 +27,39 @@ from .eml_parser import parse_eml, render_eml_report
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Rate limiter ---
-limiter = Limiter(key_func=get_remote_address)
+# --- Config ---
+APP_API_KEY        = os.environ["APP_API_KEY"]
+DB_PATH            = os.environ.get("DB_PATH", "/data/glimpse.db")
+GLIMPSE_PUBLIC_URL = os.environ.get("GLIMPSE_PUBLIC_URL", "https://glimpseadmin.mck.la")
+TRUSTED_PROXY      = os.environ.get("TRUSTED_PROXY_MODE", "true").lower() == "true"
+DEFAULT_EXPIRY     = 7
+MAX_EXPIRY         = 90
+MAX_FILE_SIZE_MB   = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+MAX_FILE_BYTES     = MAX_FILE_SIZE_MB * 1024 * 1024
+
+# Brute force lockout config
+BF_MAX_ATTEMPTS    = int(os.environ.get("BF_MAX_ATTEMPTS", "10"))     # attempts before lockout
+BF_WINDOW_MINUTES  = int(os.environ.get("BF_WINDOW_MINUTES", "15"))   # window to count attempts
+BF_LOCKOUT_MINUTES = int(os.environ.get("BF_LOCKOUT_MINUTES", "30"))  # first lockout duration
+BF_HARD_LOCKOUT_MINUTES = int(os.environ.get("BF_HARD_LOCKOUT_MINUTES", "1440"))  # 24h after 3 lockouts
+BF_LOCKOUT_THRESHOLD = int(os.environ.get("BF_LOCKOUT_THRESHOLD", "3"))  # lockouts before hard lockout
+
+def get_real_ip(request: Request) -> str:
+    """Get real client IP, preferring CF-Connecting-IP when TRUSTED_PROXY_MODE is true."""
+    if TRUSTED_PROXY:
+        cf = request.headers.get("CF-Connecting-IP")
+        if cf:
+            return cf.strip()
+    fwd = request.headers.get("X-Forwarded-For")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+# Use real IP for all rate limiting
+limiter = Limiter(key_func=get_real_ip)
 app = FastAPI(title="Glimpse")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-# --- Config ---
-APP_API_KEY       = os.environ["APP_API_KEY"]
-DB_PATH           = os.environ.get("DB_PATH", "/data/glimpse.db")
-GLIMPSE_PUBLIC_URL = os.environ.get("GLIMPSE_PUBLIC_URL", "https://glimpseadmin.mck.la")
-DEFAULT_EXPIRY    = 7
-MAX_EXPIRY        = 90
-MAX_FILE_SIZE_MB  = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
-MAX_FILE_BYTES    = MAX_FILE_SIZE_MB * 1024 * 1024
 
 # Initialise storage backend once at module load
 storage = get_backend()
@@ -158,24 +176,100 @@ def init_db():
             user_agent TEXT,
             portal_key TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS failed_logins (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip              TEXT NOT NULL,
+            attempted_at    TEXT NOT NULL,
+            locked_until    TEXT,
+            lockout_count   INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_failed_logins_ip ON failed_logins(ip);
+        CREATE INDEX IF NOT EXISTS idx_access_log_slug  ON access_log(slug);
+        CREATE INDEX IF NOT EXISTS idx_published_slug   ON published(slug);
     """)
     conn.commit()
     conn.close()
 
-# --- Auth ---
+# --- Auth & brute force protection ---
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+def _bf_check(ip: str, conn) -> tuple[bool, str]:
+    """
+    Check if IP is currently locked out.
+    Returns (is_locked, reason_message).
+    """
+    now = datetime.now(timezone.utc)
+
+    # Check active lockout
+    row = conn.execute(
+        "SELECT locked_until, lockout_count FROM failed_logins WHERE ip=? ORDER BY id DESC LIMIT 1",
+        (ip,)
+    ).fetchone()
+
+    if row and row["locked_until"]:
+        locked_until = datetime.fromisoformat(row["locked_until"])
+        if now < locked_until:
+            remaining = int((locked_until - now).total_seconds() / 60) + 1
+            logger.warning(f"Auth blocked for {ip} - locked for {remaining} more minutes")
+            return True, f"Too many failed attempts. Try again in {remaining} minutes."
+
+    return False, ""
+
+def _bf_record_failure(ip: str, conn):
+    """Record a failed login attempt and apply lockout if threshold reached."""
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(minutes=BF_WINDOW_MINUTES)).isoformat()
+
+    # Count recent failures
+    recent = conn.execute(
+        "SELECT COUNT(*) FROM failed_logins WHERE ip=? AND attempted_at >= ? AND locked_until IS NULL",
+        (ip, window_start)
+    ).fetchone()[0]
+
+    # Get lockout count for this IP
+    lockout_row = conn.execute(
+        "SELECT lockout_count FROM failed_logins WHERE ip=? AND locked_until IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (ip,)
+    ).fetchone()
+    lockout_count = (lockout_row["lockout_count"] if lockout_row else 0)
+
+    # Record this attempt
+    conn.execute(
+        "INSERT INTO failed_logins (ip, attempted_at) VALUES (?,?)",
+        (ip, now.isoformat())
+    )
+
+    # Apply lockout if threshold reached
+    if recent + 1 >= BF_MAX_ATTEMPTS:
+        new_lockout_count = lockout_count + 1
+        if new_lockout_count >= BF_LOCKOUT_THRESHOLD:
+            duration = BF_HARD_LOCKOUT_MINUTES
+        else:
+            duration = BF_LOCKOUT_MINUTES
+        locked_until = (now + timedelta(minutes=duration)).isoformat()
+        conn.execute(
+            "INSERT INTO failed_logins (ip, attempted_at, locked_until, lockout_count) VALUES (?,?,?,?)",
+            (ip, now.isoformat(), locked_until, new_lockout_count)
+        )
+        logger.warning(f"IP {ip} locked out for {duration} minutes (lockout #{new_lockout_count})")
+
+    conn.commit()
+
+def _bf_clear(ip: str, conn):
+    """Clear failed login history for IP on successful auth."""
+    conn.execute("DELETE FROM failed_logins WHERE ip=?", (ip,))
+    conn.commit()
+
 def verify_key(api_key: str = Depends(api_key_header)):
+    """Verify API key - does NOT do brute force check (use check_auth for that)."""
     if api_key != APP_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return api_key
 
 def get_client_ip(request: Request) -> str:
-    cf = request.headers.get("CF-Connecting-IP")
-    if cf: return cf
-    fwd = request.headers.get("X-Forwarded-For")
-    if fwd: return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    return get_real_ip(request)
 
 # --- Slug ---
 def generate_slug(conn) -> str:
@@ -272,9 +366,10 @@ async def serve_vault(slug: str, request: Request):
 def config():
     backend_name = storage.__class__.__name__.replace("Backend", "").lower()
     return JSONResponse({
-        "public_url":   GLIMPSE_PUBLIC_URL,
-        "backend":      backend_name,
-        "max_file_mb":  MAX_FILE_SIZE_MB,
+        "public_url":      GLIMPSE_PUBLIC_URL,
+        "backend":         backend_name,
+        "max_file_mb":     MAX_FILE_SIZE_MB,
+        "trusted_proxy":   TRUSTED_PROXY,
     })
 
 # --- Words ---
@@ -285,11 +380,36 @@ def words(_key: str = Depends(verify_key)):
         "nouns":      list(dict.fromkeys(NOUNS)),
     })
 
-# --- Auth probe ---
+# --- Auth probe with brute force protection ---
 @app.post("/api/auth")
-@limiter.limit("5/minute")
-async def auth_check(request: Request, _key: str = Depends(verify_key)):
-    return JSONResponse({"ok": True})
+async def auth_check(request: Request):
+    """
+    Login endpoint with brute force protection.
+    - 10 failed attempts within 15 minutes triggers a 30 minute lockout
+    - 3 lockouts triggers a 24 hour hard lockout
+    - Always returns 401 on failure (no info leakage between wrong key vs locked)
+    """
+    ip  = get_real_ip(request)
+    key = request.headers.get("X-API-Key", "")
+    conn = get_db()
+    try:
+        # Check lockout first
+        locked, msg = _bf_check(ip, conn)
+        if locked:
+            return Response(status_code=401)  # silent - same as wrong key
+
+        # Verify key
+        if key != APP_API_KEY:
+            _bf_record_failure(ip, conn)
+            logger.warning(f"Failed auth attempt from {ip}")
+            return Response(status_code=401)
+
+        # Success - clear failure history
+        _bf_clear(ip, conn)
+        logger.info(f"Successful auth from {ip}")
+        return JSONResponse({"ok": True})
+    finally:
+        conn.close()
 
 # --- Login audit ---
 @app.post("/api/login_audit")
@@ -421,6 +541,29 @@ def access_log(slug: str, _key: str = Depends(verify_key)):
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# --- Brute force status (admin) ---
+@app.get("/api/lockouts")
+def lockouts(_key: str = Depends(verify_key)):
+    """Show currently locked IPs and recent failed attempts."""
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        active = conn.execute(
+            "SELECT ip, locked_until, lockout_count FROM failed_logins WHERE locked_until > ? ORDER BY locked_until DESC",
+            (now,)
+        ).fetchall()
+        recent = conn.execute(
+            """SELECT ip, COUNT(*) as attempts, MAX(attempted_at) as last_attempt
+               FROM failed_logins WHERE attempted_at >= datetime('now', '-24 hours') AND locked_until IS NULL
+               GROUP BY ip ORDER BY attempts DESC LIMIT 50"""
+        ).fetchall()
+        return JSONResponse({
+            "active_lockouts": [dict(r) for r in active],
+            "recent_failures": [dict(r) for r in recent],
+        })
+    finally:
+        conn.close()
 
 # --- Portal log ---
 @app.get("/api/portal_log")

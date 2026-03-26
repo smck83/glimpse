@@ -290,6 +290,7 @@
     <div class="admin-sub-tabs">
       <button class="admin-sub-tab active" onclick="switchAdminTab(event,'slugs')">Published Pages</button>
       <button class="admin-sub-tab" onclick="switchAdminTab(event,'portallog')">Portal Log</button>
+      <button class="admin-sub-tab" onclick="switchAdminTab(event,'security')">Security</button>
     </div>
 
     <!-- Slugs sub-panel -->
@@ -308,6 +309,18 @@
       <div class="card">
         <div class="card-label">Portal Login History</div>
         <div id="portalLogContent"><div class="empty-state">Loading...</div></div>
+      </div>
+    </div>
+
+    <!-- Security sub-panel -->
+    <div class="admin-sub-panel" id="admin-security">
+      <div class="card" style="margin-bottom:16px">
+        <div class="card-label">Active Lockouts</div>
+        <div id="lockoutsContent"><div class="empty-state">Loading...</div></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Recent Failed Attempts (last 24h)</div>
+        <div id="failuresContent"><div class="empty-state">Loading...</div></div>
       </div>
     </div>
   </div>
@@ -394,6 +407,7 @@ function switchAdminTab(e,tab){
   e.target.classList.add('active');
   document.getElementById('admin-'+tab).classList.add('active');
   if(tab==='portallog')loadPortalLog();
+  if(tab==='security')loadSecurity();
 }
 
 // -------------------------------------------------------
@@ -719,6 +733,53 @@ async function loadPortalLog(){
         <tbody>${trs}</tbody>
       </table>`;
   }catch(e){document.getElementById('portalLogContent').innerHTML=`<div class="empty-state" style="color:var(--danger)">Failed: ${e.message}</div>`}
+}
+
+// -------------------------------------------------------
+// Admin - security / lockouts
+// -------------------------------------------------------
+async function loadSecurity(){
+  document.getElementById('lockoutsContent').innerHTML='<div class="empty-state">Loading...</div>';
+  document.getElementById('failuresContent').innerHTML='<div class="empty-state">Loading...</div>';
+  try{
+    const data=await fetch('/api/lockouts',{headers:{'X-API-Key':sessionKey}}).then(r=>r.json());
+
+    // Active lockouts
+    if(!data.active_lockouts.length){
+      document.getElementById('lockoutsContent').innerHTML='<div class="empty-state" style="color:var(--success)">No active lockouts.</div>';
+    } else {
+      const trs=data.active_lockouts.map(r=>`
+        <tr>
+          <td style="color:var(--danger);font-weight:600">${esc(r.ip)}</td>
+          <td class="ts-cell">${fmtDate(r.locked_until)}</td>
+          <td><span class="stat-badge stat-fail">lockout #${r.lockout_count}</span></td>
+        </tr>`).join('');
+      document.getElementById('lockoutsContent').innerHTML=`
+        <table class="portal-table">
+          <thead><tr><th>IP</th><th>Locked Until</th><th>Lockout #</th></tr></thead>
+          <tbody>${trs}</tbody>
+        </table>`;
+    }
+
+    // Recent failures
+    if(!data.recent_failures.length){
+      document.getElementById('failuresContent').innerHTML='<div class="empty-state">No failed attempts in last 24h.</div>';
+    } else {
+      const trs=data.recent_failures.map(r=>`
+        <tr>
+          <td>${esc(r.ip)}</td>
+          <td><span class="stat-badge stat-fail">${r.attempts} attempts</span></td>
+          <td class="ts-cell">${fmtDate(r.last_attempt)}</td>
+        </tr>`).join('');
+      document.getElementById('failuresContent').innerHTML=`
+        <table class="portal-table">
+          <thead><tr><th>IP</th><th>Attempts</th><th>Last Attempt</th></tr></thead>
+          <tbody>${trs}</tbody>
+        </table>`;
+    }
+  }catch(e){
+    document.getElementById('lockoutsContent').innerHTML=`<div class="empty-state" style="color:var(--danger)">Failed: ${e.message}</div>`;
+  }
 }
 
 // -------------------------------------------------------
